@@ -208,6 +208,28 @@ REASONS = {
     "D_WINDOW_OVERLAP": _r(
         "D_WINDOW_OVERLAP", WARN, "design",
         "实验期内本商品自己有促销，窗口不干净", "把开始日挪到促销结束之后"),
+    # ---- M7 多实验对照编排 ----
+    "D_EXP_WINDOW": _r(
+        "D_EXP_WINDOW", ERROR, "design",
+        "实验窗不合法（日期无法解析或结束不晚于开始）", "窗口左闭右开，结束日要晚于开始日"),
+    "D_EXP_UNKNOWN": _r(
+        "D_EXP_UNKNOWN", ERROR, "design",
+        "实验不存在或已不在队列里", "刷新实验队列后再操作"),
+    "D_EXP_STATE": _r(
+        "D_EXP_STATE", WARN, "design",
+        "实验当前状态不允许该操作", "按 排队 → 确认 → 开跑 的顺序操作"),
+    "D_CONTROL_BUSY": _r(
+        "D_CONTROL_BUSY", WARN, "design",
+        "可用对照在重叠实验窗内被其它实验占用", "等占用释放、调整实验窗或补同渠道商品"),
+    "D_PLAN_STALE": _r(
+        "D_PLAN_STALE", WARN, "design",
+        "确认基于的编排已过期，期间有其它变更", "重新看一遍编排结果再确认"),
+    "D_OCCUPANCY_HELD": _r(
+        "D_OCCUPANCY_HELD", WARN, "design",
+        "对照占用与已有实验冲突，未抢占", "并发确认时后到者失败，不抢走已有占用"),
+    "D_RECOVERED": _r(
+        "D_RECOVERED", INFO, "design",
+        "启动恢复修复了分配与占用记录", "中断的写入已按日志重放或回滚"),
 }
 
 

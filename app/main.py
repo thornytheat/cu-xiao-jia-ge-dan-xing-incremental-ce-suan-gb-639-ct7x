@@ -16,6 +16,7 @@ from .modules.m4_elastic import handler as m4_handler
 from .modules.m5_lift import handler as m5_handler
 from .modules.m6_report import handler as m6_handler
 from .modules.m7_design import handler as m7_handler
+from .modules.m7_design import experiments as m7_experiments
 
 MODULES = (m1_handler, m2_handler, m3_handler, m4_handler, m5_handler, m6_handler,
            m7_handler)
@@ -32,6 +33,8 @@ def create_app(settings: config.Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.store = Store(settings.db_path)
+    # 启动恢复：上次中断的确认按分配日志重放，孤儿占用释放，缺失占用重建
+    m7_experiments.recover(app.state.store)
     app.state.ctx = web.Ctx(settings=settings, store=app.state.store)
     web.setup(app)
     app.mount("/static", StaticFiles(directory=str(web.STATIC_DIR)), name="static")

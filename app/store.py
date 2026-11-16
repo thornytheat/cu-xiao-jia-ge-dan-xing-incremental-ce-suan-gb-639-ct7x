@@ -101,6 +101,59 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    batch_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    target_lift TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    control_sku TEXT NOT NULL DEFAULT '',
+    control_channel TEXT NOT NULL DEFAULT '',
+    planned_sku TEXT NOT NULL DEFAULT '',
+    planned_channel TEXT NOT NULL DEFAULT '',
+    plan_bias TEXT NOT NULL DEFAULT '',
+    best_bias TEXT NOT NULL DEFAULT '',
+    infeasible_code TEXT NOT NULL DEFAULT '',
+    infeasible_detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    launched_at TEXT,
+    finished_at TEXT,
+    cancelled_at TEXT,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
+
+CREATE TABLE IF NOT EXISTS control_occupancy (
+    sku TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    date TEXT NOT NULL,
+    experiment_id TEXT NOT NULL,
+    PRIMARY KEY (sku, channel, date)
+);
+CREATE INDEX IF NOT EXISTS idx_occupancy_exp ON control_occupancy(experiment_id);
+
+CREATE TABLE IF NOT EXISTS allocation_journal (
+    request_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS experiment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 BATCH_TABLES = (
@@ -121,6 +174,25 @@ class Store:
         conn = sqlite3.connect(self.path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @contextmanager
+    def write(self):
+        """写事务：BEGIN IMMEDIATE 先拿写锁，读改写之间不会有第二个写者插入。
+
+        并发确认、占用重排都走这里：进到事务里的修订号与占用快照一定是最新，
+        后到者要么等锁、要么在校验上失败，不会覆盖先提交的结果。
+        """
+        conn = sqlite3.connect(self.path, timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             yield conn
             conn.commit()
         except Exception:
@@ -350,3 +422,155 @@ class Store:
     def manifest(self, batch_id: str) -> dict | None:
         rows = self._rows("SELECT json FROM manifests WHERE batch_id=?", (batch_id,))
         return json.loads(rows[0]["json"]) if rows else None
+
+    # ---------- 实验编排（多实验共享对照池） ----------
+    def experiment_insert(self, row: dict, conn=None) -> None:
+        sql = """INSERT INTO experiments (experiment_id, request_id, batch_id, sku,
+                     channel, start_date, end_date, target_lift, status, control_sku,
+                     control_channel, planned_sku, planned_channel, plan_bias,
+                     best_bias, infeasible_code, infeasible_detail, created_at,
+                     updated_at, launched_at, finished_at, cancelled_at, note)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        args = (row["experiment_id"], row["request_id"], row["batch_id"], row["sku"],
+                row["channel"], row["start_date"], row["end_date"],
+                row.get("target_lift", ""), row["status"], row.get("control_sku", ""),
+                row.get("control_channel", ""), row.get("planned_sku", ""),
+                row.get("planned_channel", ""), row.get("plan_bias", ""),
+                row.get("best_bias", ""), row.get("infeasible_code", ""),
+                row.get("infeasible_detail", ""), row["created_at"], row["updated_at"],
+                row.get("launched_at"), row.get("finished_at"), row.get("cancelled_at"),
+                row.get("note", ""))
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with self.connect() as own:
+                own.execute(sql, args)
+
+    def experiment_update(self, experiment_id: str, fields: dict, conn=None) -> None:
+        keys = sorted(fields)
+        sql = "UPDATE experiments SET " + ", ".join(f"{k}=?" for k in keys) + \
+              " WHERE experiment_id=?"
+        args = tuple(fields[k] for k in keys) + (experiment_id,)
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with self.connect() as own:
+                own.execute(sql, args)
+
+    def experiment_get(self, experiment_id: str, conn=None) -> dict | None:
+        sql = "SELECT * FROM experiments WHERE experiment_id=?"
+        if conn is not None:
+            row = conn.execute(sql, (experiment_id,)).fetchone()
+        else:
+            with self.connect() as own:
+                row = own.execute(sql, (experiment_id,)).fetchone()
+        return dict(row) if row else None
+
+    def experiment_by_request(self, request_id: str) -> dict | None:
+        rows = self._rows("SELECT * FROM experiments WHERE request_id=?", (request_id,))
+        return rows[0] if rows else None
+
+    def experiments(self, statuses: tuple[str, ...] | None = None,
+                    conn=None) -> list[dict]:
+        sql = "SELECT * FROM experiments"
+        args: tuple = ()
+        if statuses:
+            sql += " WHERE status IN (" + ",".join("?" for _ in statuses) + ")"
+            args = statuses
+        sql += " ORDER BY created_at, experiment_id"
+        if conn is not None:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+        with self.connect() as own:
+            return [dict(r) for r in own.execute(sql, args).fetchall()]
+
+    # ---------- 对照占用（同商品同渠道同日只供一个实验） ----------
+    def occupancy_replace(self, experiment_id: str, sku: str, channel: str,
+                          dates: list[str], conn) -> None:
+        """重排一个实验的占用：先删后插，同一事务里不会让出别人的行。"""
+        conn.execute("DELETE FROM control_occupancy WHERE experiment_id=?",
+                     (experiment_id,))
+        for day in dates:
+            conn.execute(
+                "INSERT INTO control_occupancy (sku, channel, date, experiment_id) "
+                "VALUES (?,?,?,?)", (sku, channel, day, experiment_id))
+
+    def occupancy_delete(self, experiment_id: str, conn=None) -> int:
+        sql = "DELETE FROM control_occupancy WHERE experiment_id=?"
+        if conn is not None:
+            return conn.execute(sql, (experiment_id,)).rowcount
+        with self.connect() as own:
+            return own.execute(sql, (experiment_id,)).rowcount
+
+    def occupancy_rows(self, conn=None) -> list[dict]:
+        sql = "SELECT * FROM control_occupancy ORDER BY date, channel, sku"
+        if conn is not None:
+            return [dict(r) for r in conn.execute(sql).fetchall()]
+        with self.connect() as own:
+            return [dict(r) for r in own.execute(sql).fetchall()]
+
+    def occupancy_of(self, experiment_id: str, conn=None) -> list[dict]:
+        sql = ("SELECT * FROM control_occupancy WHERE experiment_id=? "
+               "ORDER BY date")
+        if conn is not None:
+            return [dict(r) for r in conn.execute(sql, (experiment_id,)).fetchall()]
+        with self.connect() as own:
+            return [dict(r) for r in own.execute(sql, (experiment_id,)).fetchall()]
+
+    # ---------- 分配日志（中断重放的唯一依据） ----------
+    def journal_get(self, request_id: str, conn=None) -> dict | None:
+        sql = "SELECT * FROM allocation_journal WHERE request_id=?"
+        if conn is not None:
+            row = conn.execute(sql, (request_id,)).fetchone()
+        else:
+            with self.connect() as own:
+                row = own.execute(sql, (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def journal_insert(self, row: dict, conn=None) -> None:
+        sql = """INSERT INTO allocation_journal (request_id, kind, payload, status,
+                     created_at, applied_at) VALUES (?,?,?,?,?,?)"""
+        args = (row["request_id"], row["kind"], row["payload"], row["status"],
+                row["created_at"], row.get("applied_at"))
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with self.connect() as own:
+                own.execute(sql, args)
+
+    def journal_mark(self, request_id: str, status: str, applied_at: str | None,
+                     conn=None) -> None:
+        sql = "UPDATE allocation_journal SET status=?, applied_at=? WHERE request_id=?"
+        if conn is not None:
+            conn.execute(sql, (status, applied_at, request_id))
+        else:
+            with self.connect() as own:
+                own.execute(sql, (status, applied_at, request_id))
+
+    def journal_pending(self) -> list[dict]:
+        return self._rows(
+            "SELECT * FROM allocation_journal WHERE status='pending' "
+            "ORDER BY created_at, request_id")
+
+    # ---------- 事件与修订号（乐观锁 + 审计） ----------
+    def event_add(self, experiment_id: str, kind: str, detail: str,
+                  created_at: str, conn=None) -> None:
+        sql = ("INSERT INTO experiment_events (experiment_id, kind, detail, "
+               "created_at) VALUES (?,?,?,?)")
+        if conn is not None:
+            conn.execute(sql, (experiment_id, kind, detail, created_at))
+        else:
+            with self.connect() as own:
+                own.execute(sql, (experiment_id, kind, detail, created_at))
+
+    def experiment_revision(self, conn=None) -> int:
+        sql = "SELECT COALESCE(MAX(id), 0) AS rev FROM experiment_events"
+        if conn is not None:
+            row = conn.execute(sql).fetchone()
+        else:
+            with self.connect() as own:
+                row = own.execute(sql).fetchone()
+        return int(row["rev"]) if row else 0
+
+    def experiment_events(self, limit: int = 50) -> list[dict]:
+        return self._rows(
+            "SELECT * FROM experiment_events ORDER BY id DESC LIMIT ?", (limit,))

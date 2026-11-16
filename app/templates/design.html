@@ -224,4 +224,151 @@
   <p class="empty">还没有可设计的历史序列。</p>
 </section>
 {% endif %}
+
+<section class="section">
+  <div class="section-head">
+    <h2 class="section-title">实验队列</h2>
+    <p class="section-figure">{{ board.experiments | length }} 个 · 修订 {{ board.revision }}</p>
+  </div>
+  {% if board.experiments %}
+  <div class="table-wrap">
+    <table class="grid" data-sortable>
+      <thead>
+        <tr><th>实验</th><th>目标</th><th>实验窗</th><th>状态</th><th>持有对照</th><th>计划对照</th><th class="num">趋势差</th><th class="num">占用天数</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for exp in board.experiments %}
+        <tr>
+          <td>{{ exp.experiment_id }}</td>
+          <td>{{ exp.sku }} · {{ exp.channel }}</td>
+          <td>{{ exp.start_date }} → {{ exp.end_date }}</td>
+          <td>
+            <span class="tag tag-{{ 'error' if exp.locked else ('ok' if exp.rearrangeable else 'warn') }}">
+              {{ exp.status_label }}{{ " · 已锁定" if exp.locked else (" · 可重排" if exp.rearrangeable else "") }}
+            </span>
+            {% if exp.infeasible_code %}
+            <br><span class="tag tag-warn" title="{{ exp.infeasible_detail }}">{{ exp.infeasible_code }}</span>
+            {% endif %}
+          </td>
+          <td>{{ exp.control_sku or "—" }}</td>
+          <td>{{ exp.planned_sku or "—" }}</td>
+          <td class="num">{{ exp.plan_bias or "—" }}</td>
+          <td class="num">{{ exp.occupancy_days }}</td>
+          <td>
+            {% if exp.status == "confirmed" %}
+            <form class="inline" method="post" data-endpoint="/api/experiments/{{ exp.experiment_id }}/launch" data-reload="1"><button class="btn btn-small" type="submit">开跑</button></form>
+            {% endif %}
+            {% if exp.status == "running" %}
+            <form class="inline" method="post" data-endpoint="/api/experiments/{{ exp.experiment_id }}/finish" data-reload="1"><button class="btn btn-small" type="submit">结束</button></form>
+            {% endif %}
+            {% if exp.rearrangeable or exp.locked %}
+            <form class="inline" method="post" data-endpoint="/api/experiments/{{ exp.experiment_id }}/cancel" data-reload="1"><button class="btn btn-small btn-ghost" type="submit">取消</button></form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">队列是空的。用下面的表单把当前设计加入排队。</p>
+  {% endif %}
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2 class="section-title">对照编排</h2>
+    <p class="section-figure">整组趋势差 {{ board.plan.total_bias }} · 总损失 {{ board.plan.total_loss }} · 可分配 {{ board.plan.assigned }} · 无解 {{ board.plan.infeasible }}</p>
+  </div>
+  {% if board.plan.rows %}
+  <div class="table-wrap">
+    <table class="grid" data-sortable>
+      <thead>
+        <tr><th>实验</th><th>目标</th><th>实验窗</th><th>状态</th><th>分配对照</th><th class="num">趋势差</th><th>各自最佳</th><th class="num">最佳趋势差</th><th class="num">相对损失</th><th>结论</th></tr>
+      </thead>
+      <tbody>
+        {% for row in board.plan.rows %}
+        <tr>
+          <td>{{ row.experiment_id }}</td>
+          <td>{{ row.sku }} · {{ row.channel }}</td>
+          <td>{{ row.start_date }} → {{ row.end_date }}</td>
+          <td>{{ board.status_labels[row.status] }}{{ " · 锁定" if row.locked else "" }}</td>
+          <td>{{ row.planned_sku or "—" }}</td>
+          <td class="num">{{ row.planned_bias or "—" }}</td>
+          <td>{{ row.best_sku or "—" }}</td>
+          <td class="num">{{ row.best_bias or "—" }}</td>
+          <td class="num">{{ row.loss or "—" }}</td>
+          <td>
+            {% if row.feasible %}
+            <span class="tag tag-ok">可分配</span>
+            {% else %}
+            <span class="tag tag-error" title="{{ row.detail }}">{{ row.code }}</span>
+            <br><small class="trunc" title="{{ row.detail }}">{{ row.detail }}</small>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if not board.plan.exact %}<p class="form-note is-warn">分量过大，本轮按贪心近似分配。</p>{% endif %}
+  <form class="form" method="post" data-endpoint="/api/experiments/confirm" data-reload="1">
+    <input type="hidden" name="base_revision" value="{{ board.revision }}">
+    <input type="hidden" name="request_id" value="confirm-r{{ board.revision }}">
+    <div class="actions">
+      <button class="btn" type="submit"{% if not board.plan.assigned %} disabled{% endif %}>确认占用（修订 {{ board.revision }}）</button>
+    </div>
+    <p class="form-note">确认把当前编排落成占用：草案可重排，已开跑的锁定不动；并发确认时后到者失败，不抢走已有占用。</p>
+  </form>
+  {% else %}
+  <p class="empty">没有在途实验，无需编排。</p>
+  {% endif %}
+  <form class="form" method="post" data-endpoint="/api/experiments/recover" data-reload="1">
+    <div class="actions">
+      <button class="btn btn-ghost" type="submit">恢复占用记录</button>
+    </div>
+    <p class="form-note">写入中断后点这里：重放未完成的分配日志、释放孤儿占用、补齐缺失占用。</p>
+  </form>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2 class="section-title">新建实验</h2>
+    <p class="section-figure">排队参与下一轮编排</p>
+  </div>
+  <form class="form" method="post" data-endpoint="/api/experiments" data-reload="1">
+    <label class="field">
+      <span>目标商品</span>
+      <select name="sku">
+        {% for item in options %}
+        <option value="{{ item.sku }}"{% if params.get("sku") == item.sku %} selected{% endif %}>{{ item.sku }} · {{ item.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>渠道</span>
+      <select name="channel">
+        {% for channel in (options | map(attribute="channel") | unique | list) %}
+        <option value="{{ channel }}"{% if params.get("channel") == channel %} selected{% endif %}>{{ channel }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span>开始日</span>
+      <input name="start_date" value="{{ plan.start_date if plan else '' }}" placeholder="2026-11-01" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>结束日</span>
+      <input name="end_date" value="{{ plan.end_date if plan else '' }}" placeholder="2026-12-13" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>目标效应</span>
+      <input name="target_lift" value="{{ params.get('target_lift') or '0.10' }}" autocomplete="off">
+    </label>
+    <div class="actions">
+      <button class="btn" type="submit"{% if not plan %} disabled{% endif %}>加入排队</button>
+    </div>
+    <p class="form-note">同一商品同一窗口重复提交只算一次；入队后参与整组编排，确认后占用对照，开跑后锁定。</p>
+  </form>
+</section>
 {% endblock %}

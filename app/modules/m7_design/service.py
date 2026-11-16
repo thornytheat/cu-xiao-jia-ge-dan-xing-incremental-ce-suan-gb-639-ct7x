@@ -173,6 +173,11 @@ def _trend_window(series, windows, sku: str, channel: str):
     return {day.isoformat() for day in days}, ""
 
 
+def clean_trend_window(series, windows, sku: str, channel: str):
+    """_trend_window 的公开入口：多实验编排与单实验设计共用同一套干净窗口定义。"""
+    return _trend_window(series, windows, sku, channel)
+
+
 def design(store, batch_id: str, params: dict) -> dict:
     """算一次实验设计；返回页面与 API 共用的同一份结构。"""
     sku, channel = _resolve_key(store, batch_id, params)
